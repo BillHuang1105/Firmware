@@ -32,76 +32,31 @@
  *
  ****************************************************************************/
 
+#include "NavioSysRCInput.hpp"
+
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
-#include <stdio.h>
-#include <stdint.h>
-#include <unistd.h>
-#include <string.h>
-#include <stdlib.h>
-
-#include <px4_platform_common/px4_config.h>
-#include <px4_platform_common/workqueue.h>
-#include <px4_platform_common/defines.h>
-
-#include <drivers/drv_hrt.h>
-
-#include <uORB/PublicationMulti.hpp>
-#include <uORB/topics/input_rc.h>
 
 namespace navio_sysfs_rc_in
 {
-
-extern "C" __EXPORT int navio_sysfs_rc_in_main(int argc, char *argv[]);
 
 #define RCINPUT_DEVICE_PATH_BASE "/sys/kernel/rcio/rcin"
 
 #define RCINPUT_MEASURE_INTERVAL_US 20000 // microseconds
 
-
-class RcInput
+NavioSysRCInput::NavioSysRCInput() :
+	ScheduledWorkItem(MODULE_NAME, px4::wq_configurations::hp_default)
 {
-public:
-	RcInput() = default;
-
-	~RcInput()
-	{
-		work_cancel(HPWORK, &_work);
-		_isRunning = false;
-	}
-
-	/* @return 0 on success, -errno on failure */
-	int start();
-
-	/* @return 0 on success, -errno on failure */
-	void stop();
-
-	/* Trampoline for the work queue. */
-	static void cycle_trampoline(void *arg);
-
-	bool isRunning() { return _isRunning; }
-
-private:
-	void _cycle();
-	void _measure();
-
-	int navio_rc_init();
-
-	bool _shouldExit{false};
-	bool _isRunning{false};
-	work_s _work{};
-
-	uORB::PublicationMulti<input_rc_s>	_rcinput_pub{ORB_ID(input_rc)};
-
-	int _channels{8};	// D8R-II plus
-	int _ch_fd[input_rc_s::RC_INPUT_MAX_CHANNELS] {};
-
-	input_rc_s _data{};
-
 };
 
-int RcInput::navio_rc_init()
+NavioSysRCInput::~NavioSysRCInput()
+{
+	ScheduleClear();
+	_isRunning = false;
+}
+
+int NavioSysRCInput::navio_rc_init()
 {
 	int i;
 	char buf[64];
@@ -125,7 +80,7 @@ int RcInput::navio_rc_init()
 	return 0;
 }
 
-int RcInput::start()
+int NavioSysRCInput::start()
 {
 	int result = navio_rc_init();
 
@@ -134,41 +89,24 @@ int RcInput::start()
 		return -1;
 	}
 
-	_isRunning = true;
-	result = work_queue(HPWORK, &_work, (worker_t)&RcInput::cycle_trampoline, this, 0);
-
-	if (result == -1) {
-		_isRunning = false;
-	}
+	ScheduleOnInterval(RCINPUT_MEASURE_INTERVAL_US);
 
 	return result;
 }
 
-void RcInput::stop()
+void NavioSysRCInput::stop()
 {
 	_shouldExit = true;
 }
 
-void RcInput::cycle_trampoline(void *arg)
+void NavioSysRCInput::Run()
 {
-	RcInput *dev = static_cast<RcInput *>(arg);
-	dev->_cycle();
-}
-
-void RcInput::_cycle()
-{
-	_measure();
-
-	if (!_shouldExit) {
-		work_queue(HPWORK, &_work, (worker_t)&RcInput::cycle_trampoline, this,
-			   USEC2TICK(RCINPUT_MEASURE_INTERVAL_US));
+	if (_shouldExit) {
+		ScheduleClear();
 	}
-}
 
-void RcInput::_measure(void)
-{
-	uint64_t ts;
-	char buf[12];
+	uint64_t ts{};
+	char buf[12] {};
 
 	for (int i = 0; i < _channels; ++i) {
 		int res;
@@ -195,97 +133,7 @@ void RcInput::_measure(void)
 	_data.rc_lost = false;
 	_data.input_source = input_rc_s::RC_INPUT_SOURCE_PX4IO_PPM;
 
-	_rcinput_pub.publish(_data);
-}
-
-/**
- * Print the correct usage.
- */
-static void usage(const char *reason);
-
-static void
-usage(const char *reason)
-{
-	if (reason) {
-		PX4_ERR("%s", reason);
-	}
-
-	PX4_INFO("usage: navio_sysfs_rc_in {start|stop|status}");
-}
-
-static RcInput *rc_input = nullptr;
-
-int navio_sysfs_rc_in_main(int argc, char *argv[])
-{
-	if (argc < 2) {
-		usage("missing command");
-		return 1;
-	}
-
-	if (!strcmp(argv[1], "start")) {
-
-		if (rc_input != nullptr && rc_input->isRunning()) {
-			PX4_WARN("already running");
-			/* this is not an error */
-			return 0;
-		}
-
-		rc_input = new RcInput();
-
-		// Check if alloc worked.
-		if (rc_input == nullptr) {
-			PX4_ERR("alloc failed");
-			return -1;
-		}
-
-		int ret = rc_input->start();
-
-		if (ret != 0) {
-			PX4_ERR("start failed");
-		}
-
-		return 0;
-	}
-
-	if (!strcmp(argv[1], "stop")) {
-
-		if (rc_input == nullptr || !rc_input->isRunning()) {
-			PX4_WARN("not running");
-			/* this is not an error */
-			return 0;
-		}
-
-		rc_input->stop();
-
-		// Wait for task to die
-		int i = 0;
-
-		do {
-			/* wait up to 3s */
-			usleep(100000);
-
-		} while (rc_input->isRunning() && ++i < 30);
-
-		delete rc_input;
-		rc_input = nullptr;
-
-		return 0;
-	}
-
-	if (!strcmp(argv[1], "status")) {
-		if (rc_input != nullptr && rc_input->isRunning()) {
-			PX4_INFO("running");
-
-		} else {
-			PX4_INFO("not running\n");
-		}
-
-		return 0;
-	}
-
-	usage("unrecognized command");
-	return 1;
-
+	_input_rc_pub.publish(_data);
 }
 
 }; // namespace navio_sysfs_rc_in
